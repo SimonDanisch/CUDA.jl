@@ -187,7 +187,7 @@ total_memory
 CuStream
 isdone(::CuStream)
 priority_range
-priority
+priority(::CuStream)
 synchronize(::CuStream)
 @sync
 ```
@@ -266,18 +266,28 @@ occupancy
 
 ## Graph Execution
 
-CUDA graphs can be easily recorded and executed using the high-level `@captured` macro:
+CUDA graphs record a sequence of operations so that they can be launched with less overhead.
+See the [Graphs](@ref UsageGraphs) section of the manual for an introduction.
 
 ```@docs
+capture
+capture!
+CuGraph
+CuGraphNode
+instantiate
+CuGraphExec
+launch(::CuGraphExec)
+upload
+update
+update!
 @captured
+CaptureError
+is_capturing
+capture_status
 ```
 
-Low-level operations are available too:
+## Deferred resource cleanup
 
 ```@docs
-CuGraph
-capture
-instantiate
-launch(::CuGraphExec)
-update
+resource_finalizer
 ```

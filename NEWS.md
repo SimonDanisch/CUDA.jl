@@ -15,6 +15,61 @@ are listed as subsections of the minor release they belong to.
 
 ## v6.5 (unreleased)
 
+*Technically breaking changes*:
+
+- GPU resources are no longer released from finalizers, as many of the CUDA calls
+  that release them wait for all running kernels to finish, which could stall or
+  deadlock whichever thread the garbage collector runs on. Collected memory is now
+  released the next time CUDA.jl allocates memory or synchronizes, or within a
+  second, so `GC.gc()` by itself doesn't make it available anymore. Releases that
+  may wait for the GPU, like unpinning memory or destroying some library objects,
+  are deferred until memory is reclaimed: on an out-of-memory error, or when
+  calling `CUDA.reclaim()`. Pinned arrays are kept alive until then.
+- `JULIA_CUDA_MEMORY_POOL=none` now also disables the memory pools that are used
+  to allocate host and unified memory.
+- The stream that `stream()` returns in a task is handed to another task once
+  the task has finished and the work on the stream has completed, instead of
+  being kept alive until the GC collects the task. This keeps applications that
+  spawn many short-lived GPU tasks from piling up thousands of streams, which
+  each hold on to device memory and slow down memory allocation. Code that uses
+  a task's stream after the task has finished should create its own stream with
+  `CuStream()` instead.
+- Pointers that are taken from GPU memory inside the function passed to
+  `CUDA.with_managed` are assumed to be used by an operation on the stream
+  passed to `with_managed`, and no longer wait on the CPU for other streams
+  that used the memory before. Code that passes such pointers to libraries,
+  other streams or the CPU should take them outside of `with_managed`
+  ([#3329](https://github.com/JuliaGPU/CUDA.jl/pull/3329)).
+
+*New features*:
+
+- `CUDA.resource_finalizer` registers a finalizer that releases CUDA resources
+  on a regular task instead of from the garbage collector, for use by packages
+  that wrap objects of CUDA libraries.
+- Host and unified memory is allocated from stream-ordered memory pools where
+  supported (CUDA 13 and later), or otherwise cached for reuse, making allocating
+  and freeing such memory considerably faster.
+- `CUDA.priority!(p)` sets the priority of the current task's GPU work, by
+  switching the task to a stream of that priority that is ordered after its
+  previous one; `CUDA.priority!(p) do ... end` restores the previous stream
+  afterwards. `p` is `:low`, `:normal`, `:high`, or an integer from
+  `priority_range()`, and `CUDA.priority()` returns the current priority.
+  `KernelAbstractions.priority!` uses the same mechanism, and no longer creates
+  a new stream on every call.
+- Tasks that are spawned while capturing a graph, e.g., by a library that
+  parallelizes its work using `Threads.@spawn`, take part in the capture: their
+  GPU operations are captured on the capture's stream, in the order the tasks
+  perform them, instead of being executed right away. These tasks need to
+  finish before the capture ends. Changing the stream of a task that takes part
+  in a capture, using `stream!`, is not supported and throws an error.
+- Handing an array to another task no longer blocks the CPU until the stream
+  that last used the array has finished all of its work. For the operations
+  that CUDA.jl submits itself (kernel launches, including broadcasts and
+  KernelAbstractions kernels, copies, `fill!` and graph launches), the stream
+  of the new task now waits for the previous one on the GPU. Library calls and
+  pointers that are passed to other code still wait on the CPU
+  ([#3329](https://github.com/JuliaGPU/CUDA.jl/pull/3329)).
+
 *Bug fixes*:
 
 - Indexing a `CuDeviceArray` with multiple indices checks every index against
@@ -22,6 +77,31 @@ are listed as subsections of the minor release they belong to.
   checked, so out-of-bounds indices that happened to linearize into the array
   (e.g. `A[3, 1]` on a 2×2 array) were accepted. Linear indexing now also
   rejects indices below 1.
+- 8- and 16-bit atomics on the last element of an array no longer make
+  `compute-sanitizer` abort the kernel. These atomics operate on the containing
+  32-bit word, so allocations and shared memory arrays are now padded to whole
+  words.
+- The output of a kernel that throws an exception is flushed before reporting
+  the exception.
+- Memory that failed to be pinned, e.g. because it was registered already
+  using `CUDA.register`, or that has been unpinned, isn't recorded as pinned
+  anymore. Re-pinning a resized array doesn't lead to unpinning it twice.
+- Unified-memory arrays can be accessed from the CPU while other tasks or
+  threads are using the GPU, on devices without concurrent managed access
+  (Windows, and Jetson boards up to Orin). Previously, that crashed with a
+  memory access error.
+
+*Minor changes*:
+
+- An array that another task uses doesn't wait for work that the host already
+  waited for, by synchronizing the stream or an event recorded after that work
+  on the task that submitted it. Work submitted through a pointer taken outside
+  of a CUDA.jl operation (e.g. with `pointer(a)`) is only waited for if it was
+  submitted from that task's stream before the array is used on another stream.
+- A task whose stream waited for an event with `CUDA.wait(event)` uses arrays
+  last used before that event without waiting for other work that was queued
+  after it. This lets tasks spawned with `KernelAbstractions.@spawn` overlap
+  with their parent.
 
 
 ## v6.4 (September 2026)

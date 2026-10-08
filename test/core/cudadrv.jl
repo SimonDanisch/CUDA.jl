@@ -421,55 +421,6 @@ end
 
 ############################################################################################
 
-@testset "graph" begin
-
-let A = CUDA.zeros(Int, 1)
-    # ensure compilation
-    A .+= 1
-    @test Array(A) == [1]
-    @test !is_capturing()
-
-    graph = capture() do
-        @test is_capturing()
-        A .+= 1
-    end
-    @test !is_capturing()
-    @test Array(A) == [1]
-
-    exec = instantiate(graph)
-    CUDA.launch(exec)
-    @test Array(A) == [2]
-
-    graph′ = capture() do
-        A .+= 2
-    end
-
-    update(exec, graph′)
-    CUDA.launch(exec)
-    @test Array(A) == [4]
-end
-
-let A = CUDA.zeros(Int, 1)
-    function iteration(A, val)
-        # custom kernel to force compilation on the first iteration
-        function kernel(a, val)
-            a[] += val
-            return
-        end
-        @cuda kernel(A, val)
-        return
-    end
-
-    for i in 1:2
-        @captured iteration(A, i)
-    end
-    @test Array(A) == [3]
-end
-
-end
-
-############################################################################################
-
 @testset "memory" begin
 
 let
@@ -769,6 +720,14 @@ if attribute(device(), CUDA.DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED) != 0
         copyto!(hA, dA)
         copyto!(dA, hA)
     end
+
+    # pinning memory that is registered already fails, without recording the pin
+    hA = rand(UInt8, 512)
+    mem = CUDA.register(CUDA.HostMemory, pointer(hA), sizeof(hA))
+    @test_throws CUDA.CuError CUDA.pin(hA)
+    CUDA.unregister(mem)
+    CUDA.pin(hA)
+    @test CUDA.is_pinned(pointer(hA))
 end
 
 end
@@ -957,42 +916,25 @@ end
 # compute-sanitizer serializes kernels, which the tests below rely on not happening
 sanitize || @testset "cooperative synchronization" begin
 
-# keep the GPU busy until the host opens a gate. this keeps the tests below independent of
-# timing: a synchronization can only return after the task that opens the gate has run. if
-# that does not happen (e.g., because the thread it runs on is blocked), the kernel gives up
-# after a while, and records that it timed out, instead of hanging.
-function gate_kernel(gate::Ptr{UInt32}, cycles)
-    t0 = clock(UInt64)
-    while unsafe_load(gate, :monotonic) == 0
-        if clock(UInt64) - t0 >= cycles
-            unsafe_store!(gate, UInt32(1), 2)
-            break
-        end
-    end
-    return
-end
-gate = zeros(UInt32, 2)     # (is open, timed out)
+# keep the GPU busy with a `gate_kernel` (see helpers.jl). this keeps the tests below
+# independent of timing: a synchronization can only return after the task that opens the
+# gate has run.
+gate = zeros(UInt32, 3)     # (is open, timed out, started)
 gpu_gate = unsafe_wrap(CuArray, gate)
 gate_ptr = reinterpret(Ptr{UInt32}, pointer(gpu_gate))
-timeout = UInt64(60_000 * attribute(device(), CUDA.DEVICE_ATTRIBUTE_CLOCK_RATE))
+timeout = gate_timeout()
 open_gate() = unsafe_store!(pointer(gate), UInt32(1), :release)
 gate_is_open() = unsafe_load(pointer(gate), :acquire) != 0
 
 # run `f` while a kernel on `stream` keeps the GPU busy until the gate is opened, returning
 # whether `f` succeeded and the gate was opened in time.
 function gated(f, stream)
-    # while the gate is closed, nothing on the host may wait for the GPU to become idle,
-    # as e.g. freeing memory does. so avoid running finalizers, by collecting beforehand
-    # and not collecting while the gate is closed.
-    GC.gc(true)
-    gc_enabled = GC.enable(false)
     ret = GC.@preserve gpu_gate try
         gate .= 0
         @cuda stream=stream gate_kernel(gate_ptr, timeout)
         f()
     finally
         open_gate()
-        GC.enable(gc_enabled)
         # also when `f` failed, as the gate is reused
         synchronize(stream)
     end
@@ -1052,6 +994,162 @@ for s in (default_stream(), legacy_stream(), per_thread_stream())
     end)
 end
 
+# finalizers do not wait for the GPU, which they could when freeing memory, so collecting
+# garbage while the GPU is busy doesn't block the thread
+@noinline function make_garbage!(garbage)
+    # (in a function, as top-level code may keep temporaries alive)
+    garbage[] = vcat(
+        # memory allocated by CUDA.jl
+        [CuArray{Float32,1,M}(undef, 1024)
+         for M in (CUDA.DeviceMemory, CUDA.HostMemory, CUDA.UnifiedMemory) for _ in 1:10],
+        # registered host memory
+        [CUDA.pin(zeros(UInt8, 1 << 20)) for _ in 1:10],
+        [unsafe_wrap(CuArray{Float32,1,CUDA.HostMemory}, zeros(Float32, 1024)) for _ in 1:10],
+        # objects whose destruction waits for running kernels
+        [CuTextureArray{Float32,2}(undef, (64, 64)) for _ in 1:10],
+        [CuModule(".version 6.0\n.target sm_50\n.address_size 64\n.visible .entry k() { ret; }\n")
+         for _ in 1:10])
+    return map(WeakRef, garbage[])
+end
+let s = CuStream(), garbage = Ref{Any}()
+    weak = make_garbage!(garbage)
+    @test gated(s) do
+        garbage[] = nothing
+        GC.gc()
+        open_gate_during(() -> synchronize(s))
+    end
+    @test all(ref -> ref.value === nothing, weak)
+end
+
+# objects whose destruction doesn't wait for the GPU are destroyed right away
+# (constructed before closing the gate, as creating them may wait for the GPU)
+let s = CuStream(), link = CuLink(), texture = CuTexture(CuTextureArray(zeros(Float32, 16)))
+    add_file!(link, joinpath(@__DIR__, "ptx/vadd_child.ptx"), CUDA.JIT_INPUT_PTX)
+    add_data!(link, "vadd_parent", read(joinpath(@__DIR__, "ptx/vadd_parent.ptx"), String))
+    complete(link)
+    @test gated(s) do
+        finalize(link)
+        finalize(texture)
+        CUDA.pool_status(devnull)
+        !gate_is_open()
+    end
+    CUDA.reclaim()
+end
+
+# a capture that starts while reclaiming memory waits for the GPU fails instead of waiting
+let s = CuStream()
+    @test gated(s) do
+        reclaimer = @async CUDA.reclaim()
+        # (the task only yields once it waits for the GPU)
+        yield()
+        @test !istaskdone(reclaimer)
+        @test_throws ErrorException capture(() -> nothing)
+        open_gate()
+        wait(reclaimer)
+        istaskdone(reclaimer)
+    end
+end
+
+# memory last used on a stream that was destroyed explicitly is freed on a non-blocking
+# stream, as the legacy default stream would wait for unrelated work
+let old = CuStream(), blocked = CuStream(), opener = CuStream(),
+    a = CuArray{UInt8}(undef, 4096)
+    CUDA.stream!(() -> fill!(a, 0), old)
+    synchronize(old)
+    CUDA.unsafe_destroy!(old)
+    @test gated(blocked) do
+        unsafe_free!(a)
+        @cuda stream=opener noop_kernel()
+        synchronize(opener)
+        !gate_is_open()
+    end
+end
+
+# run `f` while another task owns `s`, the stream of a task that has finished
+function while_reused(f, s)
+    release = Base.Event()
+    owners = Task[]
+    try
+        for _ in 1:64
+            claimed = Channel{CuStream}(1)
+            push!(owners, Threads.@spawn begin
+                put!(claimed, stream())
+                wait(release)
+            end)
+            bind(claimed, owners[end])
+            take!(claimed) == s && return f()
+        end
+        error("the stream of a finished task was not reused")
+    finally
+        notify(release)
+        foreach(wait, owners)
+    end
+end
+
+# memory last used on a stream that has been handed to another task doesn't wait for the
+# work of the new owner, neither when it's used nor when it's freed
+for M in (CUDA.DeviceMemory, CUDA.HostMemory, CUDA.UnifiedMemory)
+    a, s = fetch(Threads.@spawn begin
+        a = CuArray{UInt8,1,M}(undef, 4096)
+        fill!(a, 0x2a)
+        synchronize()
+        a, stream()
+    end)
+    while_reused(s) do
+        @test gated(s) do
+            Array(a) == fill(0x2a, 4096) || return false
+            unsafe_free!(a)
+            !gate_is_open()
+        end
+    end
+    CUDA.reclaim()
+end
+
+# memory released after the stream it was last used on has been destroyed (as happens when
+# both are collected) is not reused before the work on that stream has finished, without
+# making work on other streams wait as well
+touch_kernel(a) = (@inbounds a[1] = 1; return)
+# (launched beforehand, as with --check-bounds=yes it can throw, and the first launch in a
+#  context of a kernel that prints waits for the GPU to become idle)
+let a = CuArray{UInt8,1,CUDA.HostMemory}(undef, 1)
+    @cuda touch_kernel(a)
+    synchronize()
+end
+for M in (CUDA.DeviceMemory, CUDA.HostMemory, CUDA.UnifiedMemory), stream_first in (true, false)
+    GC.gc(true)
+    s = CuStream(; flags=CUDA.STREAM_NON_BLOCKING)
+    other = CuStream()
+    a = CuArray{UInt8,1,M}(undef, 4096)
+    ptr = UInt(pointer(a))
+    gate .= 0
+    @cuda stream=s gate_kernel(gate_ptr, timeout)
+    @cuda stream=s touch_kernel(a)
+    try
+        # finalizing the stream retires it, and querying the pool status releases it
+        if stream_first
+            finalize(s)
+            CUDA.pool_status(devnull)
+            CUDA.unsafe_free!(a)
+        else
+            CUDA.unsafe_free!(a)
+            finalize(s)
+            CUDA.pool_status(devnull)
+        end
+
+        # if the memory is reused, using it waits for the pending work
+        b = CuArray{UInt8,1,M}(undef, 4096)
+        @test UInt(pointer(b)) != ptr || !CUDA.isdone(stream())
+
+        # unrelated work doesn't
+        @cuda stream=other noop_kernel()
+        synchronize(other)
+    finally
+        open_gate()
+        device_synchronize()
+    end
+    @test gate[2] == 0
+end
+
 # a long wait does not delay other ones
 let long = CuStream()
     # set up the other tasks before closing the gate, as creating a stream (including a
@@ -1088,6 +1186,277 @@ let long = CuStream()
         wait(waiter)
         waiting
     end
+end
+
+# memory used by CUDA.jl operations on another stream is handed off on the device: the new
+# stream waits for the old one, without blocking the host
+let a = CUDA.zeros(Int, 1), b = CUDA.zeros(Int, 1), u = cu([0]; unified=true),
+    s = stream(), other = CuStream(), third = CuStream()
+    # warm up, as compiling kernels waits for the GPU to become idle
+    for x in (a, u)
+        x .+= 1
+        fetch(Threads.@spawn (stream!(other); x .*= 2; copyto!(b, a)))
+        fetch(Threads.@spawn (stream!(third); x .-= 1))
+        synchronize(third)
+        x .= 1
+    end
+
+    # kernels and copies don't block, and still execute in order
+    @test gated(s) do
+        a .+= 1
+        fetch(Threads.@spawn begin
+            stream!(other)
+            a .*= 2
+            fetch(Threads.@spawn (stream!(third); a .-= 1; copyto!(b, a)))
+            !CUDA.isdone(s)
+        end)
+    end
+    synchronize(third)
+    @test Array(a) == [3]
+    @test Array(b) == [3]
+
+    # synchronizing the memory also waits for the stream it was handed off from
+    @test gated(s) do
+        a .+= 1
+        fetch(Threads.@spawn (stream!(other); a .*= 2))
+        open_gate_during(() -> synchronize(a))
+    end
+    @test Array(a) == [8]
+
+    # other consumers of a pointer, like a library, get the memory ready on the host, also
+    # when the stream that hands it to them already waits for the previous use
+    for hops in (1, 2)
+        @test gated(s) do
+            a .+= 1
+            fetch(Threads.@spawn begin
+                stream!(other)
+                a .*= 2
+                if hops == 2
+                    fetch(Threads.@spawn (stream!(third); a .-= 1))
+                end
+                open_gate_during(() -> Base.unsafe_convert(CuPtr{Int}, a))
+            end)
+        end
+    end
+    @test Array(a) == [37]
+
+    # capturing doesn't wait for memory that was handed off, but launching the graph takes
+    # ownership of it, so a launch on yet another stream waits for it on the device
+    @test gated(s) do
+        a .+= 1
+        fetch(Threads.@spawn begin
+            stream!(other)
+            a .*= 2
+            graph = capture(() -> (a .-= 1))
+            launch(instantiate(graph), third)
+            !CUDA.isdone(s) && !CUDA.isdone(third)
+        end)
+    end
+    synchronize(third)
+    @test Array(a) == [75]
+
+    # memory that isn't device memory is still synchronized on the host
+    @test gated(s) do
+        u .+= 1
+        open_gate_during() do
+            fetch(Threads.@spawn (stream!(other); u .*= 2))
+        end
+    end
+    synchronize(other)
+    @test Array(u) == [4]
+end
+
+# memory whose last use is known to have completed doesn't need to be waited for. as the
+# kernels above don't block anyway, check that with the pointer conversion of a library.
+unsafe_use(a) = (Base.unsafe_convert(CuPtr{Int}, a); nothing)
+let a = CUDA.zeros(Int, 1), s = stream(), other = CuStream(), third = CuStream()
+    a .+= 1
+    fetch(Threads.@spawn (stream!(other); unsafe_use(a)))
+    synchronize()
+
+    # the host waited for an event recorded after the last use
+    a .+= 1
+    e = CuEvent()
+    record(e)
+    @test gated(s) do
+        fetch(Threads.@spawn begin
+            stream!(other)
+            synchronize(e)
+            unsafe_use(a)
+            !CUDA.isdone(s)
+        end)
+    end
+
+    # but not for a use after that event
+    e = CuEvent()
+    record(e)
+    @test gated(s) do
+        a .+= 1
+        open_gate_during() do
+            fetch(Threads.@spawn (stream!(other); synchronize(e); unsafe_use(a)))
+        end
+    end
+
+    # an event recorded by another task doesn't count, as it may have been recorded before
+    # the work that used the memory was submitted
+    a .+= 1
+    e = fetch(Threads.@spawn (e = CuEvent(); record(e, s); e))
+    @test gated(s) do
+        open_gate_during() do
+            fetch(Threads.@spawn (stream!(other); synchronize(e); unsafe_use(a)))
+        end
+    end
+
+    # re-recording an event replaces the work it covers
+    a .+= 1
+    e = CuEvent()
+    record(e)
+    record(e, third)
+    @test gated(s) do
+        open_gate_during() do
+            fetch(Threads.@spawn (stream!(other); synchronize(e); unsafe_use(a)))
+        end
+    end
+
+    # a stream can be used by another task once the previous one has finished
+    s2 = CuStream()
+    wait(Threads.@spawn (stream!(s2); synchronize(s2)))
+    e = fetch(Threads.@spawn begin
+        stream!(s2)
+        a .+= 1
+        e = CuEvent()
+        record(e)
+        e
+    end)
+    @test gated(s2) do
+        fetch(Threads.@spawn begin
+            stream!(other)
+            synchronize(e)
+            unsafe_use(a)
+            !CUDA.isdone(s2)
+        end)
+    end
+    synchronize(s2)
+    @test Array(a) == [6]
+end
+
+# work submitted through a pointer that was taken before synchronizing the stream isn't
+# covered by that synchronization, so other tasks using the memory still need to wait for it
+store_kernel(x) = (@inbounds x[1] = 42; return)
+raw_array(p::CuPtr{Int}) =
+    CuDeviceArray{Int,1,CUDA.AS.Global}(reinterpret(Core.LLVMPtr{Int,CUDA.AS.Global}, p), (1,))
+let a = CUDA.zeros(Int, 1), s = stream(), other = CuStream()
+    # warm up, as compiling kernels waits for the GPU to become idle
+    @cuda stream=s store_kernel(raw_array(pointer(a)))
+    fetch(Threads.@spawn (stream!(other); a .+= 1; unsafe_use(a)))
+    synchronize(other)
+
+    # library pointer conversions on another task wait for the launch
+    p = pointer(a)
+    synchronize(s)
+    @test gated(s) do
+        @cuda stream=s store_kernel(raw_array(p))
+        open_gate_during() do
+            fetch(Threads.@spawn (stream!(other); unsafe_use(a)))
+        end
+    end
+
+    # and so do kernels on another task's stream
+    p = pointer(a)
+    synchronize(s)
+    @test gated(s) do
+        @cuda stream=s store_kernel(raw_array(p))
+        fetch(Threads.@spawn begin
+            stream!(other)
+            a .+= 1
+            !CUDA.isdone(other)
+        end)
+    end
+    synchronize(other)
+    @test Array(a) == [43]
+end
+
+# an event can be recorded again while another task waits for it, which then doesn't tell
+# anything about the work covered by the earlier recording
+let a = CUDA.zeros(Int, 1), s = stream(), other = CuStream(), e = CuEvent()
+    @test gated(s) do
+        a .+= 1
+        record(e)
+        waiter = Threads.@spawn synchronize(e)
+        for _ in 1:100
+            yield()
+        end
+        record(e, other)
+        wait(waiter)
+        open_gate_during() do
+            fetch(Threads.@spawn (stream!(other); unsafe_use(a)))
+        end
+    end
+end
+
+# memory whose last use is known to come before the work on a stream, because that stream
+# waited for an event recorded after it, doesn't need to be handed off. this is the pattern
+# `KernelAbstractions.@spawn` uses.
+let a = CUDA.zeros(Int, 1), s = stream(), other = CuStream()
+    a .+= 1
+    fetch(Threads.@spawn (stream!(other); a .+= 1; unsafe_use(a)))
+    synchronize()
+
+    # kernels on the waiting stream don't wait for work queued after the event
+    a .+= 1
+    e = CuEvent()
+    record(e)
+    @test gated(s) do
+        fetch(Threads.@spawn begin
+            stream!(other)
+            CUDA.wait(e)
+            a .+= 1
+            synchronize(other)
+            !CUDA.isdone(s)
+        end)
+    end
+
+    # library pointer conversions only wait for the waiting stream
+    a .+= 1
+    e = CuEvent()
+    record(e)
+    @test gated(s) do
+        fetch(Threads.@spawn begin
+            stream!(other)
+            CUDA.wait(e)
+            unsafe_use(a)
+            !CUDA.isdone(s)
+        end)
+    end
+
+    # memory used after the event still needs to be waited for
+    e = CuEvent()
+    record(e)
+    @test gated(s) do
+        a .+= 1
+        fetch(Threads.@spawn begin
+            stream!(other)
+            CUDA.wait(e)
+            a .+= 1
+            open_gate_during(() -> synchronize(other))
+        end)
+    end
+
+    # and so is work submitted through a pointer that was taken before the event
+    p = pointer(a)
+    e = CuEvent()
+    record(e)
+    @test gated(s) do
+        @cuda stream=s store_kernel(raw_array(p))
+        fetch(Threads.@spawn begin
+            stream!(other)
+            CUDA.wait(e)
+            a .+= 1
+            open_gate_during(() -> synchronize(other))
+        end)
+    end
+    synchronize(other)
+    @test Array(a) == [43]
 end
 
 end

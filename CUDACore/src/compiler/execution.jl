@@ -93,30 +93,36 @@ end
                     managed::Vector{Managed}) where {B,F,A,S} =
     KernelCall{B,F,A,S}(backend, f, arguments, source, managed)
 
-@inline @generated function kernel_call(backend::B, f::F, args::A) where {B,F,A<:Tuple}
+@inline function kernel_call(backend::B, f::F, args::A) where {B,F,A<:Tuple}
+    roots = (f=f, arguments=args)
+    GC.@preserve roots begin
+        managed = Managed[]
+        kernel_f = kernel_convert(backend, f, managed)
+        f_range = 1:length(managed)
+        arguments, argument_ranges = kernel_convert_arguments(backend, args, managed)
+        managed_ranges = (f=f_range, arguments=argument_ranges)
+        source = (f=roots.f, arguments=roots.arguments, managed=managed_ranges)
+        kernel_call(backend, kernel_f, arguments, source, managed)
+    end
+end
+
+# convert the arguments, returning them along with the range of `managed` that each one
+# added. not inlined, so that kernels taking the same arguments share this code.
+@noinline @generated function kernel_convert_arguments(backend, args::A,
+                                                       managed::Vector{Managed}) where {A<:Tuple}
     converted = [gensym(:converted) for _ in 1:fieldcount(A)]
-    ranges = [gensym(:managed_range) for _ in 1:fieldcount(A)+1]
+    ranges = [gensym(:managed_range) for _ in 1:fieldcount(A)]
     conversions = Any[]
     for i in 1:fieldcount(A)
         push!(conversions, quote
             start = length(managed) + 1
             $(converted[i]) = kernel_convert(backend, args[$i], managed)
-            $(ranges[i+1]) = start:length(managed)
+            $(ranges[i]) = start:length(managed)
         end)
     end
     quote
-        roots = (f=f, arguments=args)
-        GC.@preserve roots begin
-            managed = Managed[]
-            start = 1
-            kernel_f = kernel_convert(backend, f, managed)
-            $(ranges[1]) = start:length(managed)
-            $(conversions...)
-            arguments = ($(converted...),)
-            managed_ranges = (f=$(ranges[1]), arguments=($(ranges[2:end]...),))
-            source = (f=roots.f, arguments=roots.arguments, managed=managed_ranges)
-            kernel_call(backend, kernel_f, arguments, source, managed)
-        end
+        $(conversions...)
+        return ($(converted...),), ($(ranges...),)
     end
 end
 
@@ -395,61 +401,130 @@ function Adapt.adapt_storage(to::KernelAdaptor, managed::Managed)
     return managed
 end
 
-function lock_managed(managed::AbstractVector{<:Managed})
-    # Sort globally to avoid deadlocks and make duplicates adjacent.
-    locked = sort(managed; by=memory -> objectid(memory.lock))
+# the order in which to lock managed memory: sorted globally to avoid deadlocks, and with
+# duplicates removed
+function locking_order(managed::AbstractVector{<:Managed})
+    ordered = sort(managed; by=memory -> objectid(memory.lock))
     n = 0
     prev = nothing
-    for memory in locked
+    for memory in ordered
         memory === prev && continue
         n += 1
-        @inbounds locked[n] = memory
+        @inbounds ordered[n] = memory
         prev = memory
     end
-    resize!(locked, n)
-    for memory in locked
-        lock(memory.lock)
-    end
-    return locked
+    resize!(ordered, n)
+    return ordered
 end
 
-function unlock_managed(locked::AbstractVector{<:Managed})
-    for memory in Iterators.reverse(locked)
+"""
+    with_managed(f, managed::AbstractVector{<:Managed}; stream=stream())
+
+Submit an operation on `managed` memory to `stream` by calling `f`. The memory is made
+ready for use on `stream`, and locked so that it can't move to another stream before the
+operation has been submitted. Pointers to memory that are taken within `f` (e.g., by
+converting an array) are assumed to be used by an operation on `stream` too, so they don't
+wait for other streams that used the memory before.
+"""
+function with_managed(f::F, managed::AbstractVector{<:Managed};
+                      stream::CuStream=stream()) where {F}
+    with_ordered_managed(f, ordered_managed(managed); stream)
+end
+
+# (a single memory is trivially in locking order)
+ordered_managed(managed::AbstractVector{<:Managed}) =
+    length(managed) == 1 ? managed : locking_order(managed)
+
+# like `with_managed`, but for memory that's already in locking order
+function with_ordered_managed(f::F, ordered::Union{AbstractVector{<:Managed},
+                                                   Tuple{Vararg{Managed}}};
+                              stream::CuStream=stream()) where {F}
+    # (taking ownership of the memory and using it is a single submission)
+    capture_submission(stream) do
+        acquired = acquire_managed(ordered, stream)
+        try
+            return f()
+        finally
+            release_managed(acquired)
+        end
+    end
+end
+
+# lock the managed memory, transfer its ownership to `stream`, and make `stream` the
+# operation stream, returning what to pass to `release_managed`. kept out of line, as the
+# kernel launch code that uses it is compiled for every kernel.
+@noinline function acquire_managed(ordered, stream::CuStream)
+    tls = task_local_state!()
+    state = active_state(tls)
+    capturing = is_capturing(stream)
+    for memory in ordered
+        lock(memory.lock)
+    end
+    try
+        for memory in ordered
+            take_ownership!(memory; state, stream, capturing)
+        end
+    catch
+        unlock_managed(ordered, stream, capturing)
+        rethrow()
+    end
+    # pointers taken while the memory is acquired are used by an operation that CUDA.jl
+    # submits to `stream` (see `convert(::Type{CuPtr}, ::Managed)`)
+    old_stream, old_capturing = tls.operation_stream, tls.operation_capturing
+    tls.operation_stream, tls.operation_capturing = stream, capturing
+    return (; tls, ordered, stream, capturing, old_stream, old_capturing)
+end
+
+@noinline function release_managed(acquired)
+    (; tls, ordered, stream, capturing, old_stream, old_capturing) = acquired
+    tls.operation_stream, tls.operation_capturing = old_stream, old_capturing
+    unlock_managed(ordered, stream, capturing)
+end
+
+# memory is stamped with the epoch of its stream once the operation using it has been
+# submitted, also when it throws, as it may have submitted work first (see `StreamOrder`).
+# only memory that `take_ownership!` actually moved to `stream` is stamped, which captured
+# operations don't do (they execute when the graph is launched, which stamps the memory).
+function unlock_managed(ordered, stream::CuStream, capturing::Bool)
+    if !capturing
+        epoch = stream_epoch(stream)
+        for memory in ordered
+            restamp!(memory, stream, epoch)
+        end
+    end
+    for memory in Iterators.reverse(ordered)
         unlock(memory.lock)
     end
     return
 end
 
-function with_managed(f::F, managed::AbstractVector{<:Managed};
-                      stream::CuStream=stream()) where {F}
-    state = active_state()
-    capturing = is_capturing(stream)
-    if length(managed) == 1
-        memory = @inbounds managed[1]
-        lock(memory.lock)
-        try
-            take_ownership!(memory; state, stream, capturing)
-            return f()
-        finally
-            unlock(memory.lock)
-        end
-    end
-    locked = lock_managed(managed)
+restamp!(memory::Managed, stream::CuStream, epoch::UInt64) =
+    (memory.stream == stream && (memory.epoch = epoch); return)
+
+function managed_kernel_launch(backend, kernel, arguments, managed; kwargs...)
+    # tasks that are part of a capture submit while holding its lock (see `CaptureScope`)
+    current_capture_scope() === nothing ||
+        return scoped_kernel_launch(backend, kernel, arguments, managed; kwargs...)
+    isempty(managed) && return kernel_launch(backend, kernel, arguments; kwargs...)
+    target_stream = haskey(kwargs, :stream) ? kwargs[:stream] : stream()
+    acquired = acquire_managed(ordered_managed(managed), target_stream)
     try
-        for memory in locked
-            take_ownership!(memory; state, stream, capturing)
-        end
-        return f()
+        kernel_launch(backend, kernel, arguments; kwargs...)
     finally
-        unlock_managed(locked)
+        release_managed(acquired)
     end
 end
 
-function managed_kernel_launch(backend, kernel, arguments, managed; kwargs...)
-    isempty(managed) && return kernel_launch(backend, kernel, arguments; kwargs...)
+# (not specialized, as it would be compiled for every kernel, but only used by tasks that
+# are part of a capture)
+@noinline function scoped_kernel_launch(@nospecialize(backend), @nospecialize(kernel),
+                                       @nospecialize(arguments), managed; kwargs...)
     target_stream = haskey(kwargs, :stream) ? kwargs[:stream] : stream()
-    with_managed(managed; stream=target_stream) do
-        kernel_launch(backend, kernel, arguments; kwargs...)
+    capture_submission(target_stream) do
+        isempty(managed) && return kernel_launch(backend, kernel, arguments; kwargs...)
+        with_managed(managed; stream=target_stream) do
+            kernel_launch(backend, kernel, arguments; kwargs...)
+        end
     end
 end
 
@@ -460,7 +535,7 @@ Adapt.adapt_storage(to::KernelAdaptor, p::CuPtr{T}) where {T} =
 
 # convert CUDA host arrays to device arrays
 function Adapt.adapt_storage(to::KernelAdaptor, xs::DenseCuArray{T,N}) where {T,N}
-  managed = xs.data[]
+  managed = check_capture(xs.data)[]
   push!(to.managed, managed)
   ptr = convert(CuPtr{T}, managed.mem) + xs.offset
   CuDeviceArray{T,N,AS.Global}(reinterpret(LLVMPtr{T,AS.Global}, ptr), size(xs),
@@ -719,11 +794,18 @@ in a hot path without degrading performance. New code will be generated automati
 when function changes, or when different types or keyword arguments are provided.
 """
 function cufunction(f::F, tt::TT=Tuple{}; kwargs...) where {F,TT}
-    cuda = active_state()
+    source = methodinstance(F, tt)
+    fun, state = cufunction_link(source; kwargs...)
+    return HostKernel{F,tt}(f, fun, state)
+end
 
+# the parts of `cufunction` that don't depend on the type of the function, kept separate so
+# that they are compiled once rather than for every kernel
+function cufunction_link(source::Core.MethodInstance; kwargs...)
     Base.@lock cufunction_lock begin
+        cuda = active_state()
+
         # look up (or generate) the compilation artifacts for this function
-        source = methodinstance(F, tt)
         config = compiler_config(cuda.device; kwargs...)::CUDACompilerConfig
         # Target selection may retain a PTX-compatible target for reflection, but
         # executing a kernel requires a cubin that loads on this device.
@@ -758,30 +840,25 @@ function cufunction(f::F, tt::TT=Tuple{}; kwargs...) where {F,TT}
             end
         end
 
-        # create a callable object that captures the function instance. we don't need to think
-        # about world age here, as GPUCompiler already does and will return a different object
-        key = (objectid(source), hash(fun), f)
-        kernel = get(_kernel_instances, key, nothing)
-        if kernel === nothing
-            # create the kernel state object
+        state = get(_kernel_states, fun, nothing)
+        if state === nothing
             state = KernelState(create_exceptions!(fun.mod), UInt32(0))
-
-            kernel = HostKernel{F,tt}(f, fun, state)
-            _kernel_instances[key] = kernel
+            _kernel_states[fun] = state
         end
-        return kernel::HostKernel{F,tt}
+        return fun, state
     end
 end
 
-# cache of kernel instances
-const _kernel_instances = Dict{Any, Any}()
+# the state of every kernel, which is created when the kernel is first used
+const _kernel_states = Dict{CuFunction, KernelState}()
 
 # task-local RNG for kernel launch seeds, so that launching a kernel does not
 # perturb the user-visible `rand()` stream
 launch_rng() = get!(Random.Xoshiro, task_local_storage(),
                     :CUDACore_launch_rng)::Random.Xoshiro
 
-make_seed(::HostKernel) = rand(launch_rng(), UInt32)
+make_seed(::HostKernel) = launch_seed()
+@noinline launch_seed() = rand(launch_rng(), UInt32)
 
 
 ## device-side kernels

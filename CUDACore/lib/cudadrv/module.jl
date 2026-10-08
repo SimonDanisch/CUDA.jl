@@ -13,9 +13,11 @@ function checked_cuModuleLoadDataEx(_module, image, numOptions, options, optionV
     #      available, but cached by the allocator. by configuring the allocator with a
     #      release threshold, we have it actually free up that memory, but that requires
     #      synchronizing all streams to make sure pending frees are actually executed.
-    if !is_capturing()
-        device_synchronize()
-    end
+    #
+    #      that would invalidate graphs that are being captured, so skip it then. like
+    #      reclaiming memory, this makes captures that start meanwhile fail, as waiting
+    #      for the GPU could deadlock if a kernel depends on the capturing task.
+    is_capturing() || releasing(device_synchronize; blocking=true)
 
     # FIXME: maybe all CUDA API calls need to run under retry_reclaim?
     #        that would require a redesign of the memory pool,
@@ -90,7 +92,8 @@ mutable struct CuModule
 
         ctx = current_context()
         obj = new(handle_ref[], ctx)
-        finalizer(unsafe_unload!, obj)
+        # unloading a module waits for running kernels to finish
+        resource_finalizer(unsafe_unload!, obj; ctx)
         return obj
     end
 end

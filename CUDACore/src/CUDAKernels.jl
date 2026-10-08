@@ -55,7 +55,7 @@ function KI.copyto!(::CUDABackend, A::ContiguousArray{T}, B::ContiguousArray{T})
     length(A) == length(B) ||
         throw(ArgumentError("Arrays must have the same length, got $(length(A)) and $(length(B))"))
     if isbitstype(T) && (on_device(A) || on_device(B))
-        GC.@preserve A B begin
+        GC.@preserve A B CUDACore.with_managed_arrays(A, B) do
             unsafe_copyto!(pointer(A), pointer(B), length(A), async=true)
         end
     else
@@ -241,29 +241,7 @@ function KI.priority!(::CUDABackend, prio::Symbol)
     if !(prio in (:high, :normal, :low))
         error("priority must be one of :high, :normal, :low")
     end
-
-    range = priority_range()
-    # 0:-1:-5
-    # lower number is higher priority, default is 0
-    # there is no "low"
-    if prio === :high
-        priority = last(range)
-    elseif prio === :normal || prio === :low
-        priority = first(range)
-    end
-
-    old_stream = stream()
-    r_flags = Ref{Cuint}()
-    CUDACore.cuStreamGetFlags(old_stream, r_flags)
-    flags = CUDACore.CUstream_flags_enum(r_flags[])
-
-    event = CuEvent(CUDACore.EVENT_DISABLE_TIMING)
-    record(event, old_stream)
-
-    @debug "Switching default stream" flags priority _group=:CUDA
-    new_stream = CuStream(; flags, priority)
-    CUDACore.wait(event, new_stream)
-    stream!(new_stream)
+    CUDACore.priority!(prio)
     return nothing
 end
 

@@ -30,6 +30,8 @@ using ExprTools: splitdef, combinedef
 
 using LLVMLoopInfo
 
+import ScopedValues
+
 using CUDA_Driver_jll
 
 import CUDA_Runtime_jll
@@ -99,6 +101,7 @@ include("device/quirks.jl")
 
 # array essentials
 include("memory.jl")
+include("resources.jl")
 include("array.jl")
 include("refpointer.jl")
 
@@ -106,6 +109,9 @@ include("refpointer.jl")
 include("compiler/compilation.jl")
 include("compiler/execution.jl")
 include("compiler/exceptions.jl")
+
+# graphs
+include("graph.jl")
 
 # array implementation
 include("utilities.jl")

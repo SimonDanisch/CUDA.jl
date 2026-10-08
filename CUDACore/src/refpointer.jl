@@ -44,15 +44,23 @@ mutable struct CuRefValue{T} <: AbstractCuRef{T}
         check_eltype("CuRef", T)
         buf = pool_alloc(DeviceMemory, aligned_sizeof(T))
         obj = new(buf)
-        finalizer(obj) do _
-            pool_free(buf)
-        end
+        resource_finalizer(obj)
         return obj
     end
 end
+release_now(ref::CuRefValue) = pool_free(ref.buf)
+
 function CuRefValue{T}(x::T) where {T}
     ref = CuRefValue{T}()
-    ref[] = x
+    if in_capture(stream())
+        # initializing a reference while capturing would add a memory copy to the graph,
+        # which is relatively expensive to launch. instead, initialize it right away: the
+        # memory was allocated for this capture (see `capture_alloc`), so it can't be used
+        # by any operations that were captured before.
+        initialize_during_capture(ref.buf, x)
+    else
+        ref[] = x
+    end
     return ref
 end
 CuRefValue{T}(x) where {T} = CuRefValue{T}(convert(T, x))
