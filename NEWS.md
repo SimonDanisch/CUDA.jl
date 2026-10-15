@@ -26,17 +26,6 @@ small reductions along a dimension can be slower.
 
 *Technically breaking changes*:
 
-- `CUDA.QuickSort` and `CUDA.BitonicSort` are removed. Use the default
-  algorithm, Base's algorithm objects, or AcceleratedKernels' (e.g.
-  `sort!(x; alg=AcceleratedKernels.MergeSort())`).
-- The internal `CUDACore.scan!` is removed; use `accumulate!`.
-- `GPUArrays.neutral_element` is no longer consulted by reductions or scans, and
-  the `GPUArrays.mapreducedim!` method for `CuArray` is gone; use
-  `Base.mapreducedim!`.
-- Results and errors that differed from Base now match it, e.g.
-  `maximum(CuArray(Int[]))` throws an `ArgumentError` (it returned
-  `typemin(Int)`), and `sum(CuArray([1, 2]); init=Int8(0))` returns an `Int`
-  (it returned an `Int8`).
 - GPU resources are no longer released from finalizers, as many of the CUDA calls
   that release them wait for all running kernels to finish, which could stall or
   deadlock whichever thread the garbage collector runs on. Collected memory is now
@@ -60,6 +49,23 @@ small reductions along a dimension can be slower.
   that used the memory before. Code that passes such pointers to libraries,
   other streams or the CPU should take them outside of `with_managed`
   ([#3329](https://github.com/JuliaGPU/CUDA.jl/pull/3329)).
+- The low-level atomic functions (`atomic_add!`, `atomic_cas!`, etc.) are now
+  relaxed, like CUDA C's `atomicAdd` and friends: they no longer order the
+  memory accesses around them, which they were documented to do but, before
+  CUDA.jl 6.4, didn't. Code that synchronizes threads through them needs an
+  ordered atomic (e.g. `UnsafeAtomics.add!(ptr, val, UnsafeAtomics.acq_rel,
+  UnsafeAtomics.device)`) or a fence (`threadfence()`).
+- `CUDA.QuickSort` and `CUDA.BitonicSort` are removed. Use the default
+  algorithm, Base's algorithm objects, or AcceleratedKernels' (e.g.
+  `sort!(x; alg=AcceleratedKernels.MergeSort())`).
+- The internal `CUDACore.scan!` is removed; use `accumulate!`.
+- `GPUArrays.neutral_element` is no longer consulted by reductions or scans, and
+  the `GPUArrays.mapreducedim!` method for `CuArray` is gone; use
+  `Base.mapreducedim!`.
+- Results and errors that differed from Base now match it, e.g.
+  `maximum(CuArray(Int[]))` throws an `ArgumentError` (it returned
+  `typemin(Int)`), and `sum(CuArray([1, 2]); init=Int8(0))` returns an `Int`
+  (it returned an `Int8`).
 
 *New features*:
 
@@ -89,8 +95,37 @@ small reductions along a dimension can be slower.
   of the new task now waits for the previous one on the GPU. Library calls and
   pointers that are passed to other code still wait on the CPU
   ([#3329](https://github.com/JuliaGPU/CUDA.jl/pull/3329)).
+- The atomic functions are implemented with UnsafeAtomics.jl, emitting LLVM
+  atomics that the NVPTX back-end lowers. For atomic loads and stores, other
+  orderings, or other operations, use UnsafeAtomics.jl directly; for atomic
+  operations on arrays, Atomix.jl's `@atomic` (as used by KernelAbstractions.jl)
+  is now preferred over `CUDA.@atomic`.
+- `@cuda debug_level=N` compiles a single kernel at debug level `N` instead of
+  the session's `-g` level, e.g., `debug_level=2` to get a device-side stack
+  trace of a failing kernel without restarting Julia.
+- Added support for CUDA 13.4 Update 2, which CUDA_Runtime_jll 0.25.0+3
+  picks up without a compat change. Its cuSOLVER again exports versioned
+  symbols, which 13.4 Update 1 had dropped.
+- Added support for cuDNN 9.27 (requires CUDNN_jll 9.27). It no longer unloads
+  runtime-compiled kernels while a CUDA graph can still launch them, which
+  could give incorrect results or illegal-address faults.
 
 *Bug fixes*:
+
+- cuDNN's `batchnorm_training!`, `batchnorm_inference!` and `batchnorm_gradient!`
+  are implemented with cuDNN's fixed-function batch normalization again. The
+  graph API has no engine for inference, `Float64`, inputs of rank 2 or 3, or
+  channel counts that are not a multiple of 4 (8 for 16-bit types), and is about
+  twice as slow where it does have one. The functions also accept `alpha` and
+  `beta` again ([#3380](https://github.com/JuliaGPU/CUDA.jl/issues/3380)).
+- cuDNN's `maxpool!`, `meanpool!`, `∇maxpool!` and `∇meanpool!` use cuDNN's
+  fixed-function pooling when the padding is symmetric, which is faster than a
+  graph (up to twice as fast for the `Float16` max-pooling gradient) and makes
+  1D pooling work. A new `nan_propagation` keyword selects whether max pooling
+  propagates NaNs (the default) or ignores them.
+- `CUDA.@atomic` with an operation that has no native instruction no longer
+  returns without updating the element when another thread stores a NaN with a
+  different payload.
 
 - Indexing a `CuDeviceArray` with multiple indices checks every index against
   its dimension, like `Base` does. Previously only the linearized index was
@@ -103,6 +138,10 @@ small reductions along a dimension can be slower.
   words.
 - The output of a kernel that throws an exception is flushed before reporting
   the exception.
+- `synchronize()` flushes the output of kernels (from `@cuprintf` and friends)
+  again. Since v6.4.2, when the stream had already finished its work, which is
+  common for short kernels, the output could only appear after, e.g., a later
+  kernel launch or blocking synchronization.
 - Memory that failed to be pinned, e.g. because it was registered already
   using `CUDA.register`, or that has been unpinned, isn't recorded as pinned
   anymore. Re-pinning a resized array doesn't lead to unpinning it twice.
@@ -110,6 +149,12 @@ small reductions along a dimension can be slower.
   threads are using the GPU, on devices without concurrent managed access
   (Windows, and Jetson boards up to Orin). Previously, that crashed with a
   memory access error.
+- `add_rn` and `mul_rn` are no longer contracted into a fused multiply-add on
+  Julia 1.10 and 1.11.
+- cuDNN dropout, and RNNs with dropout, keep a random number generator state
+  per library handle, and don't share it with other tasks or devices anymore. Dropout with
+  `cudnnDropoutSeed[]` set no longer fails in tasks other than the one that
+  first used dropout.
 
 *Minor changes*:
 
@@ -238,7 +283,7 @@ CUDA_Runtime_jll 0.24.4 and CUDA_Compiler_jll 0.6.2.
   Xavier sees from cuDNN, whose Jetson build stops at sm_75.
 
 
-### v6.4.1 (unreleased)
+### v6.4.1 (September 2026)
 
 - Added support for CUDA 13.4 Update 1: the cuBLASLt and cuSOLVER wrappers
   were regenerated (batch-invariance flags, the two-stage `Xsyevd` selector).
